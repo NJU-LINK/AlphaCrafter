@@ -11,7 +11,7 @@ This skill explains how to research, evaluate, and persist factors using a scrip
 
 ### 1. Generate Research Script
 
-- Write Python scripts into: `scripts/{miner}_{YYYYMMDD}_{description}.py`
+- Write Python scripts into: `scripts/<miner_id>_<YYYYMMDD>_<description>.py`
 - Script purposes include:
   - Computing factor values across the watchlist
   - Performing IC analysis
@@ -49,8 +49,8 @@ ls factors/
 
 Save factor definition and validation results to:
 
-```
-factors/{factor_id}.json
+```bash
+factors/<miner_id>_<YYYYMMDD>_<factor_id>.json
 ```
 
 **Note**: Always keep a list of currently effective factors in the memory summary. For fundamental factors that may be temporarily ineffective but are considered market pillars (e.g., momentum factors), conduct periodic re-validation to assess regime-dependent decay or potential re-emergence of predictive power.
@@ -70,7 +70,7 @@ Each persisted factor JSON should contain:
 | `parameters` | Configurable parameters with defaults |
 | `validation.metrics` | IC, ICIR, turnover, coverage, concentration, decay |
 | `validation.period` | Time range of validation |
-| `validation.status` | EFFECTIVE, INEFFECTIVE, or DEPRECATED |
+| `validation.status` | EFFECTIVE or DEPRECATED |
 | `validation.regime_notes` | Market conditions during validation |
 | `tags` | Categories (momentum, value, quality, etc.) |
 | `last_validated` | Timestamp of most recent validation |

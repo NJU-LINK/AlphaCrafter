@@ -3,10 +3,14 @@ import sys
 import json
 import time
 import argparse
+import yaml
+import signal
+import threading
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from agent.openai.agent import Agent
 
@@ -29,7 +33,7 @@ from agent.skills import (
     PositionManagementSkill
 )
 
-from alphacrafter.sim.utils import finish_check, get_account_dict, get_date_str
+from alphacrafter.sim.utils import finish_check, get_date_str
 
 load_dotenv()
 
@@ -38,7 +42,7 @@ load_dotenv()
 class CycleRecord:
     """Record of a single cycle's outputs from all agents."""
     cycle: int
-    miner_output: str = ""
+    miner_outputs: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # {miner_id: {output_text, success}}
     screener_output: str = ""
     trader_output: str = ""
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -47,39 +51,81 @@ class CycleRecord:
 class Launcher:
     """Orchestrates the iterative workflow of Miner, Screener, and Trader agents."""
     
-    def __init__(self, session_id: str, max_cycles: int = 300, resume: bool = False):
+    def __init__(self, session_id: str, config_path: str = "config.yaml", resume: bool = False):
         """
-        Initialize the launcher with a session ID and maximum cycles.
+        Initialize the launcher with a session ID and configuration.
         
         Args:
             session_id: Session identifier for workspace
-            max_cycles: Maximum number of workflow cycles to run
+            config_path: Path to configuration YAML file
             resume: Whether to resume from previous workflow state
         """
         self.session_id = session_id
-        self.max_cycles = max_cycles
         self.resume = resume
         self.workspace_path = None
         
+        # Load configuration
+        with open(config_path, 'r', encoding='utf-8') as f:
+            self.config = yaml.safe_load(f)
+        
+        # Extract configuration values
+        self.max_cycles = self.config['workflow']['max_cycles']
+        self.miner_count = self.config['miner']['count']
+        self.miner_ids = self.config['miner']['ids'][:self.miner_count]
+        
+        # Extract model configurations for each agent type
+        self.miner_model_config = self.config['miner']['model']
+        self.screener_model_config = self.config['screener']['model']
+        self.trader_model_config = self.config['trader']['model']
+        
         # Agent instances
-        self.miner_agent = None
+        self.miner_agents: Dict[str, Agent] = {}
         self.screener_agent = None
         self.trader_agent = None
+        
+        # Thread lock for thread-safe operations
+        self.lock = threading.Lock()
+        
+        # Stop event for graceful interruption
+        self.stop_event = threading.Event()
+        self.original_sigint_handler = None
         
         # History storage
         self.cycle_records: List[CycleRecord] = []
         
         # Logging
-        self.log_path = "../logs/workflow.json"
-        self.miner_log_path = "../logs/miner_agent.json"
-        self.screener_log_path = "../logs/screener_agent.json"
-        self.trader_log_path = "../logs/trader_agent.json"
+        self.log_path = self.config['logging']['workflow_log']
+        self.miner_log_pattern = self.config['logging']['miner_log_pattern']
+        self.screener_log_path = self.config['logging']['screener_log']
+        self.trader_log_path = self.config['logging']['trader_log']
         
-        # Store last inputs for resume mode (loaded before agent initialization)
-        self.last_miner_input = None
+        # Store last inputs for resume mode
+        self.last_miner_inputs: Dict[str, Optional[List[Dict[str, str]]]] = {
+            miner_id: None for miner_id in self.miner_ids
+        }
         self.last_screener_input = None
         self.last_trader_input = None
         
+        # Load additional info
+        self.additional_info = self.config.get('additional_info', '')
+        
+    def _setup_signal_handler(self):
+        """Setup signal handler for graceful interruption."""
+        def signal_handler(sig, frame):
+            print("\n\n⚠️  Interrupt received (Ctrl+C), stopping workflow gracefully...")
+            self.stop_event.set()
+            print("⏹️ Stop signal sent to all agents. Waiting for them to finish...")
+        
+        self.original_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal_handler)
+        print("✅ Signal handler set up for graceful interruption")
+    
+    def _restore_signal_handler(self):
+        """Restore original signal handler."""
+        if self.original_sigint_handler:
+            signal.signal(signal.SIGINT, self.original_sigint_handler)
+            print("✅ Signal handler restored")
+    
     def _get_session_workspace(self) -> str:
         """Get existing session workspace path."""
         base_dir = os.path.dirname(os.path.dirname(__file__))
@@ -128,22 +174,16 @@ class Launcher:
                 final_state = entry.get('final_state', {})
                 if final_state.get('success') and final_state.get('input'):
                     original_input = final_state['input']
-                    
-                    # Convert the input array to a single user message
                     return self._aggregate_input_to_user_message(original_input)
         
         return None
 
     def _aggregate_input_to_user_message(self, input_array: List) -> List[Dict[str, str]]:
-        """
-        Aggregate various input elements (messages, tool calls, tool outputs) 
-        into a single user message with the entire conversation context.
-        """
+        """Aggregate various input elements into a single user message."""
         if not input_array:
             return [{"role": "user", "content": ""}]
         
-        aggregated_content = "you are resuming from the previous session: " + str(input_array)  # For simplicity, we convert the entire input array to a string.
-        
+        aggregated_content = "you are resuming from the previous session: " + str(input_array)
         return [{"role": "user", "content": aggregated_content}]
     
     def _load_previous_workflow_state(self) -> Optional[int]:
@@ -169,16 +209,18 @@ class Launcher:
         for entry in entries:
             cycle_num = entry.get('cycle')
             if cycle_num not in cycles:
-                cycles[cycle_num] = {'miner': None, 'screener': None, 'trader': None}
+                cycles[cycle_num] = {'miner': [], 'screener': None, 'trader': None}
             phase = entry.get('phase')
-            if phase in cycles[cycle_num]:
+            if phase and phase.startswith('miner_'):
+                cycles[cycle_num]['miner'].append(entry)
+            elif phase in ['screener', 'trader']:
                 cycles[cycle_num][phase] = entry
         
-        # Find the last complete cycle (all three phases completed successfully)
+        # Find the last complete cycle
         last_complete_cycle = None
         for cycle_num in sorted(cycles.keys()):
             cycle_data = cycles[cycle_num]
-            if (cycle_data['miner'] and cycle_data['miner'].get('success') and
+            if (cycle_data['miner'] and all(m.get('success') for m in cycle_data['miner']) and
                 cycle_data['screener'] and cycle_data['screener'].get('success') and
                 cycle_data['trader'] and cycle_data['trader'].get('success')):
                 last_complete_cycle = cycle_num
@@ -191,7 +233,15 @@ class Launcher:
                 if cycle_num <= last_complete_cycle:
                     cycle_data = cycles[cycle_num]
                     record = CycleRecord(cycle=cycle_num)
-                    record.miner_output = cycle_data['miner'].get('output_text', '') if cycle_data['miner'] else ''
+                    
+                    # Reconstruct miner outputs
+                    for miner_entry in cycle_data['miner']:
+                        miner_id = miner_entry.get('phase', '').replace('miner_', '')
+                        record.miner_outputs[miner_id] = {
+                            'output_text': miner_entry.get('output_text', ''),
+                            'success': miner_entry.get('success', False)
+                        }
+                    
                     record.screener_output = cycle_data['screener'].get('output_text', '') if cycle_data['screener'] else ''
                     record.trader_output = cycle_data['trader'].get('output_text', '') if cycle_data['trader'] else ''
                     self.cycle_records.append(record)
@@ -210,16 +260,19 @@ class Launcher:
         print("📂 LOADING RESUME INPUTS FROM LOGS")
         print("="*60)
         
-        # Load last inputs from each agent's log
-        self.last_miner_input = self._load_last_input_from_agent_log(self.miner_log_path)
+        # Load last inputs from each miner's log
+        for miner_id in self.miner_ids:
+            miner_log_path = self.miner_log_pattern.format(miner_id=miner_id)
+            self.last_miner_inputs[miner_id] = self._load_last_input_from_agent_log(miner_log_path)
+            if self.last_miner_inputs[miner_id]:
+                print(f"✅ Loaded last miner input for {miner_id} from {miner_log_path}")
+            else:
+                print(f"⚠️ No previous miner input found for {miner_id}")
+        
+        # Load screener and trader inputs
         self.last_screener_input = self._load_last_input_from_agent_log(self.screener_log_path)
         self.last_trader_input = self._load_last_input_from_agent_log(self.trader_log_path)
         
-        if self.last_miner_input:
-            print(f"✅ Loaded last miner input from {self.miner_log_path}")
-        else:
-            print(f"⚠️ No previous miner input found")
-            
         if self.last_screener_input:
             print(f"✅ Loaded last screener input from {self.screener_log_path}")
         else:
@@ -230,32 +283,27 @@ class Launcher:
         else:
             print(f"⚠️ No previous trader input found")
     
-    def _create_miner_agent(self) -> Agent:
-        """Create and configure miner agent for factor discovery."""
+    def _create_miner_agent(self, miner_id: str) -> Agent:
+        """Create and configure a single miner agent for factor discovery."""
         toolkit = [
             ReadFileTool(),
             WriteFileTool(),
             ShellTool(),
-            SearchFactorTool(),
         ]
         
         skills = [QuantitativeTradingSkill(), FactorMiningSkill()]
         
-        ADDITIONAL_INFO = """
-Here are some market index references:
-
-CSI300 (000300.SH) is the CSI 300 Index, a capitalization-weighted stock market index designed to replicate the performance of the top 300 stocks traded on the Shanghai and Shenzhen stock exchanges. It is the primary benchmark for the Chinese A-share market, similar to the S&P 500 in the US. The index covers approximately 60% of the total market capitalization of the A-share market and is widely used for institutional investment benchmarking, index funds, and derivatives such as futures and options.
-"""
+        # Use MINER_INSTRUCTION with miner_id formatting
+        miner_instruction = MINER_INSTRUCTION.format(miner_id=miner_id)
         
         agent = Agent(
-            model_code="gpt-5.3-codex",
+            model_code=self.miner_model_config['code'],
             toolkit=toolkit,
             skills=skills,
-            instructions=QUANTITATIVE_TRADING_INSTRUCTION_A + "\n\n" + MINER_INSTRUCTION + "\n\n" + ADDITIONAL_INFO,
-            config_path="../config/models.json",
-            log_file="../logs/miner_agent.json",
+            instructions=QUANTITATIVE_TRADING_INSTRUCTION_A + "\n\n" + miner_instruction + "\n\n" + self.additional_info,
+            config_path=self.miner_model_config['config_path'],
+            log_file=self.miner_log_pattern.format(miner_id=miner_id),
             summary_interval=15,
-            force_tool_call=False
         )
         
         return agent
@@ -272,22 +320,15 @@ CSI300 (000300.SH) is the CSI 300 Index, a capitalization-weighted stock market 
         ]
         
         skills = [FactorScreeningSkill()]
-
-        ADDITIONAL_INFO = """
-Here are some market index references:
-
-CSI300 (000300.SH) is the CSI 300 Index, a capitalization-weighted stock market index designed to replicate the performance of the top 300 stocks traded on the Shanghai and Shenzhen stock exchanges. It is the primary benchmark for the Chinese A-share market, similar to the S&P 500 in the US. The index covers approximately 60% of the total market capitalization of the A-share market and is widely used for institutional investment benchmarking, index funds, and derivatives such as futures and options.
-"""
         
         agent = Agent(
-            model_code="gpt-5.3-codex",
+            model_code=self.screener_model_config['code'],
             toolkit=toolkit,
             skills=skills,
-            instructions=QUANTITATIVE_TRADING_INSTRUCTION_A + "\n\n" + SCREENER_INSTRUCTION + "\n\n" + ADDITIONAL_INFO,
-            config_path="../config/models.json",
-            log_file="../logs/screener_agent.json",
+            instructions=QUANTITATIVE_TRADING_INSTRUCTION_A + "\n\n" + SCREENER_INSTRUCTION + "\n\n" + self.additional_info,
+            config_path=self.screener_model_config['config_path'],
+            log_file=self.screener_log_path,
             summary_interval=15,
-            force_tool_call=False
         )
         
         return agent
@@ -303,27 +344,31 @@ CSI300 (000300.SH) is the CSI 300 Index, a capitalization-weighted stock market 
         
         skills = [QuantitativeTradingSkill(), StrategyRegistrationSkill(), PositionManagementSkill()]
         
-        ADDITIONAL_INFO = """
-Here are some market index references:
-
-000300.SH is the CSI 300 Index, a capitalization-weighted stock market index designed to replicate the performance of the top 300 stocks traded on the Shanghai and Shenzhen stock exchanges. It is the primary benchmark for the Chinese A-share market, similar to the S&P 500 in the US. The index covers approximately 60% of the total market capitalization of the A-share market and is widely used for institutional investment benchmarking, index funds, and derivatives such as futures and options.
-"""
-        
         agent = Agent(
-            model_code="gpt-5.3-codex",
+            model_code=self.trader_model_config['code'],
             toolkit=toolkit,
             skills=skills,
-            instructions=QUANTITATIVE_TRADING_INSTRUCTION_A + "\n\n" + TRADER_INSTRUCTION + "\n\n" + ADDITIONAL_INFO,
-            config_path="../config/models.json",
-            log_file="../logs/trader_agent.json",
+            instructions=QUANTITATIVE_TRADING_INSTRUCTION_A + "\n\n" + TRADER_INSTRUCTION + "\n\n" + self.additional_info,
+            config_path=self.trader_model_config['config_path'],
+            log_file=self.trader_log_path,
             summary_interval=15,
-            force_tool_call=False
         )
         
         return agent
     
-    def _run_agent_phase(self, agent: Agent, context: str, phase_name: str, max_iterations: int = 100) -> Dict[str, Any]:
+    def _run_agent_phase(self, agent: Agent, context: str, phase_name: str, max_iterations: int = None) -> Dict[str, Any]:
         """Run a single agent phase with given context."""
+        if max_iterations is None:
+            # Determine max_iterations based on phase
+            if phase_name.startswith('miner'):
+                max_iterations = self.config['miner']['max_iterations']
+            elif phase_name == 'screener':
+                max_iterations = self.config['screener']['max_iterations']
+            elif phase_name == 'trader':
+                max_iterations = self.config['trader']['max_iterations']
+            else:
+                max_iterations = 100
+        
         print(f"\n{'='*60}")
         print(f"🔬 {phase_name.upper()} PHASE")
         print(f"{'='*60}")
@@ -333,7 +378,8 @@ Here are some market index references:
         result = agent.run(
             input_messages, 
             max_iterations=max_iterations, 
-            finish_check=finish_check
+            finish_check=finish_check,
+            stop_event=self.stop_event  # Pass stop event for graceful interruption
         )
         
         print(f"\n{'='*60}")
@@ -343,8 +389,19 @@ Here are some market index references:
         return result
     
     def _run_agent_phase_with_resume(self, agent: Agent, last_input: Optional[List[Dict[str, str]]], 
-                                      context: str, phase_name: str, max_iterations: int = 100) -> Dict[str, Any]:
+                                      context: str, phase_name: str, max_iterations: int = None) -> Dict[str, Any]:
         """Run an agent phase, using last_input if in resume mode and available."""
+        if max_iterations is None:
+            # Determine max_iterations based on phase
+            if phase_name.startswith('miner'):
+                max_iterations = self.config['miner']['max_iterations']
+            elif phase_name == 'screener':
+                max_iterations = self.config['screener']['max_iterations']
+            elif phase_name == 'trader':
+                max_iterations = self.config['trader']['max_iterations']
+            else:
+                max_iterations = 100
+        
         if self.resume and last_input:
             print(f"\n{'='*60}")
             print(f"🔬 {phase_name.upper()} PHASE - RESUMING FROM LAST INPUT")
@@ -354,7 +411,8 @@ Here are some market index references:
             result = agent.run(
                 last_input, 
                 max_iterations=max_iterations, 
-                finish_check=finish_check
+                finish_check=finish_check,
+                stop_event=self.stop_event  # Pass stop event for graceful interruption
             )
             
             print(f"\n{'='*60}")
@@ -365,8 +423,77 @@ Here are some market index references:
         else:
             return self._run_agent_phase(agent, context, phase_name, max_iterations)
     
+    def _run_single_miner(self, miner_id: str, context: str, is_resume_cycle: bool = False) -> Dict[str, Any]:
+        """Run a single miner agent and return its output as dict."""
+        agent = self.miner_agents[miner_id]
+        miner_phase_name = f"miner_{miner_id}"
+        
+        if is_resume_cycle:
+            result = self._run_agent_phase_with_resume(
+                agent,
+                self.last_miner_inputs[miner_id],
+                context,
+                miner_phase_name
+            )
+        else:
+            result = self._run_agent_phase(agent, context, miner_phase_name)
+        
+        miner_output = {
+            'miner_id': miner_id,
+            'output_text': result.get("output_text", ""),
+            'success': result.get("success", False)
+        }
+        
+        return miner_output
+    
+    def _run_all_miners_concurrently(self, context: str, is_resume_cycle: bool = False) -> Dict[str, Dict[str, Any]]:
+        """Run all miner agents concurrently and collect results."""
+        print(f"\n{'='*60}")
+        print(f"🚀 RUNNING {len(self.miner_ids)} MINERS CONCURRENTLY")
+        print(f"{'='*60}")
+        
+        miner_outputs = {}
+        
+        with ThreadPoolExecutor(max_workers=len(self.miner_ids)) as executor:
+            # Submit all miner tasks
+            future_to_miner = {
+                executor.submit(self._run_single_miner, miner_id, context, is_resume_cycle): miner_id
+                for miner_id in self.miner_ids
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_miner):
+                miner_id = future_to_miner[future]
+                try:
+                    miner_output = future.result()
+                    miner_outputs[miner_id] = miner_output
+                    
+                    print(f"\n--- ✅ Miner {miner_id} completed ---")
+                    print(f"Output length: {len(miner_output['output_text'])}")
+                    
+                    # Log miner result
+                    self._log_workflow_entry(0, f"miner_{miner_id}", {
+                        'success': miner_output['success'],
+                        'output_text': miner_output['output_text']
+                    })
+                    
+                except Exception as e:
+                    print(f"\n--- ❌ Miner {miner_id} failed: {e} ---")
+                    miner_outputs[miner_id] = {
+                        'miner_id': miner_id,
+                        'output_text': f"Error: {str(e)}",
+                        'success': False
+                    }
+        
+        return miner_outputs
+    
     def _should_terminate(self, result: Dict[str, Any]) -> bool:
         """Determine if workflow should terminate based on result."""
+        # Check if stop event was triggered
+        if self.stop_event.is_set():
+            print("⏹️ Stop event triggered - terminating workflow")
+            return True
+        
         if result.get("interrupted", False):
             print("⏹️ Interrupted by user")
             return True
@@ -404,91 +531,64 @@ Here are some market index references:
             "timestamp": datetime.now().isoformat(),
             "success": result.get("success", False),
             "interrupted": result.get("interrupted", False),
+            "stop_event_triggered": result.get("stop_event_triggered", False),
             "output_text": result.get("output_text", "")
         })
         
         with open(self.log_path, 'w', encoding='utf-8') as f:
             json.dump(entries, f, indent=2, ensure_ascii=False, default=str)
     
-    def _build_miner_context(self) -> str:
-        """Build context for miner agent using previous miner output only."""
+    def _build_miner_context(self, miner_id: str) -> str:
+        """Build context for a specific miner agent using only its own previous output."""
         context_parts = []
         
-        # Add account and date information
-        try:
-            account = get_account_dict()
-            account_str = str(account)
-            if len(account_str) > 500:
-                account_str = account_str[:500] + "... [truncated]"
-            context_parts.append(f"Current account: {account_str}")
-            current_date = get_date_str()
-            context_parts.append(f"Current date: {current_date}")
-        except Exception as e:
-            print(f"Error getting account/date info: {e}")
-            context_parts.append(f"Failed to get account/date info: {e}")
+        # Add date information
+        current_date = get_date_str()
+        context_parts.append(f"Current date: {current_date}")
         
-        # Add previous miner output
+        # Add only this miner's previous output
         if self.cycle_records:
             last_record = self.cycle_records[-1]
-            if last_record.miner_output:
-                context_parts.append(f"Previous miner agent output: {last_record.miner_output}")
-            if last_record.screener_output:
-                context_parts.append(f"Previous screener agent output: {last_record.screener_output}")
+            
+            # Get this specific miner's previous output
+            if miner_id in last_record.miner_outputs:
+                previous_output = last_record.miner_outputs[miner_id]['output_text']
+                context_parts.append(f"Your previous output: {previous_output}...")
         
         return "\n".join(context_parts) if context_parts else ""
 
     def _build_screener_context(self) -> str:
-        """Build context for screener agent using current miner output and previous screener+trader history."""
+        """Build context for screener agent using all miner outputs and previous history."""
         context_parts = []
         
-        # Add account and date information
-        try:
-            account = get_account_dict()
-            account_str = str(account)
-            if len(account_str) > 500:
-                account_str = account_str[:500] + "... [truncated]"
-            context_parts.append(f"Current account: {account_str}")
-            current_date = get_date_str()
-            context_parts.append(f"Current date: {current_date}")
-        except Exception as e:
-            print(f"Error getting account/date info: {e}")
-            context_parts.append(f"Failed to get account/date info: {e}")
+        # Add date information
+        current_date = get_date_str()
+        context_parts.append(f"Current date: {current_date}")
         
         if not self.cycle_records:
             return "\n".join(context_parts) if context_parts else ""
         
         last_record = self.cycle_records[-1]
         
-        # Current cycle miner output
-        if last_record.miner_output:
-            context_parts.append(f"Miner agent output from current cycle: {last_record.miner_output}")
+        # Current cycle all miner outputs
+        for miner_id, output in last_record.miner_outputs.items():
+            context_parts.append(f"Miner {miner_id} output from current cycle: {output['output_text']}")
         
-        # Previous cycle screener and trader outputs (if they exist)
+        # Previous cycle screener and trader outputs
         if len(self.cycle_records) >= 2:
             prev_record = self.cycle_records[-2]
             if prev_record.screener_output:
                 context_parts.append(f"Previous screener agent output: {prev_record.screener_output}")
-            if prev_record.trader_output:
-                context_parts.append(f"Previous trader agent output: {prev_record.trader_output}")
         
         return "\n\n".join(context_parts) if context_parts else ""
 
     def _build_trader_context(self) -> str:
-        """Build context for trader agent using current screener output and previous trader history."""
+        """Build context for trader agent using current screener output and previous history."""
         context_parts = []
         
-        # Add account and date information
-        try:
-            account = get_account_dict()
-            account_str = str(account)
-            if len(account_str) > 500:
-                account_str = account_str[:500] + "... [truncated]"
-            context_parts.append(f"Current account: {account_str}")
-            current_date = get_date_str()
-            context_parts.append(f"Current date: {current_date}")
-        except Exception as e:
-            print(f"Error getting account/date info: {e}")
-            context_parts.append(f"Failed to get account/date info: {e}")
+        # Add date information
+        current_date = get_date_str()
+        context_parts.append(f"Current date: {current_date}")
         
         if not self.cycle_records:
             return "\n".join(context_parts) if context_parts else ""
@@ -508,7 +608,7 @@ Here are some market index references:
         return "\n\n".join(context_parts) if context_parts else ""
     
     def _run_single_cycle(self, cycle: int, is_resume_cycle: bool = False) -> bool:
-        """Execute a single cycle of Miner -> Screener -> Trader."""
+        """Execute a single cycle with concurrent miners."""
         print("\n" + "█"*60)
         if is_resume_cycle:
             print(f"🔄 RESUME CYCLE {cycle}/{self.max_cycles}")
@@ -518,41 +618,43 @@ Here are some market index references:
         
         record = CycleRecord(cycle=cycle)
         
-        # Step 1: Run Miner Agent (factor discovery)
-        miner_context = self._build_miner_context()
-        miner_result = self._run_agent_phase_with_resume(
-            self.miner_agent, 
-            self.last_miner_input if is_resume_cycle else None,
-            miner_context, 
-            "miner", 
-            max_iterations=100
-        )
-        record.miner_output = miner_result.get("output_text", "")
+        # Step 1: Run ALL Miner Agents concurrently
+        miner_outputs = self._run_all_miners_concurrently("", is_resume_cycle)
         
-        print(f"\n--- 🔄 Cycle {cycle} Miner Output ---")
-        print(f"{record.miner_output}")
+        # Check if any miner failed
+        all_miners_success = all(output['success'] for output in miner_outputs.values())
+        if not all_miners_success:
+            print("⚠️ Some miners failed, but continuing with available results")
         
-        self._log_workflow_entry(cycle, "miner", miner_result)
+        record.miner_outputs = miner_outputs
         
-        if self._should_terminate(miner_result):
-            return False
+        # Print all miner outputs
+        print(f"\n--- 🔄 Cycle {cycle} All Miner Outputs ---")
+        for miner_id, output in miner_outputs.items():
+            print(f"\n[{miner_id}]:")
+            print(f"{output['output_text'][:200]}...")
         
-        # Add record with miner output so screener can access it
+        # Add record with miner outputs so screener can access them
         self.cycle_records.append(record)
         
-        # Step 2: Run Screener Agent (factor selection and ensemble)
+        # Check if stop event was triggered during miner phase
+        if self.stop_event.is_set():
+            print("⏹️ Stop event triggered after miner phase - terminating cycle")
+            return False
+        
+        # Step 2: Run Screener Agent
         screener_context = self._build_screener_context()
         screener_result = self._run_agent_phase_with_resume(
             self.screener_agent,
             self.last_screener_input if is_resume_cycle else None,
             screener_context,
             "screener",
-            max_iterations=100
+            max_iterations=self.config['screener']['max_iterations']
         )
         record.screener_output = screener_result.get("output_text", "")
         
         print(f"\n--- 🔄 Cycle {cycle} Screener Output ---")
-        print(f"{record.screener_output}")
+        print(f"{record.screener_output[:200]}...")
         
         self._log_workflow_entry(cycle, "screener", screener_result)
         
@@ -562,19 +664,19 @@ Here are some market index references:
         # Update record with screener output
         self.cycle_records[-1] = record
         
-        # Step 3: Run Trader Agent (execution)
+        # Step 3: Run Trader Agent
         trader_context = self._build_trader_context()
         trader_result = self._run_agent_phase_with_resume(
             self.trader_agent,
             self.last_trader_input if is_resume_cycle else None,
             trader_context,
             "trader",
-            max_iterations=100
+            max_iterations=self.config['trader']['max_iterations']
         )
         record.trader_output = trader_result.get("output_text", "")
         
         print(f"\n--- 🔄 Cycle {cycle} Trader Output ---")
-        print(f"{record.trader_output}")
+        print(f"{record.trader_output[:200]}...")
         
         self._log_workflow_entry(cycle, "trader", trader_result)
         
@@ -584,38 +686,41 @@ Here are some market index references:
         # Final update with trader output
         self.cycle_records[-1] = record
         
-        print(f"\n💾 Cycle {cycle} completed")
+        print(f"\n💾 Cycle {cycle} completed with {len(miner_outputs)} miner(s)")
         
         return True
     
     def run(self) -> Dict[str, Any]:
-        """Run the full iterative workflow."""
+        """Run the full iterative workflow with concurrent miners."""
+        # Setup signal handler for graceful interruption
+        self._setup_signal_handler()
+        
         try:
             # Setup workspace
             self.workspace_path = self._get_session_workspace()
             self._setup_workspace()
             
             # IMPORTANT: Load resume inputs BEFORE creating agents
-            # This ensures we capture the last inputs before agent initialization
-            # might overwrite the log files
             if self.resume:
                 self._load_resume_inputs()
                 last_complete_cycle = self._load_previous_workflow_state()
             else:
                 last_complete_cycle = None
             
-            # Create agents (this may initialize/overwrite log files)
-            self.miner_agent = self._create_miner_agent()
+            # Create all agents
+            print(f"\n📊 Creating {len(self.miner_ids)} miner agents...")
+            for miner_id in self.miner_ids:
+                self.miner_agents[miner_id] = self._create_miner_agent(miner_id)
+            
             self.screener_agent = self._create_screener_agent()
             self.trader_agent = self._create_trader_agent()
             
             # Handle resume mode workflow
             if self.resume and last_complete_cycle is not None:
                 print("\n" + "="*60)
-                print(f"🚀 RESUMING WORKFLOW from cycle {last_complete_cycle + 1} (max {self.max_cycles} cycles total)")
+                print(f"🚀 RESUMING WORKFLOW from cycle {last_complete_cycle + 1} (max {self.max_cycles} cycles)")
                 print("="*60)
                 
-                # Run the resume cycle using saved inputs
                 next_cycle = last_complete_cycle + 1
                 should_continue = self._run_single_cycle(next_cycle, is_resume_cycle=True)
                 
@@ -627,21 +732,19 @@ Here are some market index references:
                         "cycle_records": [asdict(r) for r in self.cycle_records]
                     }
                 
-                # Continue with normal cycles (without resume inputs) after the first resume cycle
                 current_cycle = next_cycle
             else:
                 if self.resume:
                     print("\nNo previous workflow state found. Starting fresh.")
                 print("\n" + "="*60)
-                print(f"🚀 STARTING NEW WORKFLOW (max {self.max_cycles} cycles)")
+                print(f"🚀 STARTING NEW WORKFLOW (max {self.max_cycles} cycles, {len(self.miner_ids)} concurrent miners)")
                 print("="*60)
                 current_cycle = 0
             
             # Run remaining cycles
             cycle = current_cycle
-            while cycle < self.max_cycles:
+            while cycle < self.max_cycles and not self.stop_event.is_set():
                 cycle += 1
-                # After the first cycle (if it was a resume cycle), subsequent cycles use normal mode
                 is_resume = (self.resume and cycle == current_cycle + 1 and current_cycle > 0)
                 should_continue = self._run_single_cycle(cycle, is_resume_cycle=is_resume)
                 if not should_continue:
@@ -649,15 +752,21 @@ Here are some market index references:
             
             # Final summary
             print("\n" + "="*60)
-            print("🎯 WORKFLOW COMPLETED")
+            if self.stop_event.is_set():
+                print("⏹️ WORKFLOW STOPPED BY USER")
+            else:
+                print("🎯 WORKFLOW COMPLETED")
             print("="*60)
             print(f"Total cycles: {len(self.cycle_records)}")
+            print(f"Miners per cycle: {len(self.miner_ids)}")
             print(f"✅ Workflow log saved to {self.log_path}")
             
             return {
                 "success": True,
                 "total_cycles": len(self.cycle_records),
-                "cycle_records": [asdict(r) for r in self.cycle_records]
+                "miner_count": len(self.miner_ids),
+                "cycle_records": [asdict(r) for r in self.cycle_records],
+                "stopped_by_user": self.stop_event.is_set()
             }
             
         except FileNotFoundError as e:
@@ -669,12 +778,15 @@ Here are some market index references:
             import traceback
             traceback.print_exc()
             return {"success": False, "error": str(e)}
+        finally:
+            # Restore signal handler
+            self._restore_signal_handler()
 
 
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Run quantitative trading workflow with Miner, Screener, and Trader agents"
+        description="Run quantitative trading workflow"
     )
     parser.add_argument(
         "session_id",
@@ -682,10 +794,10 @@ def parse_arguments():
         help="Session identifier for the workspace"
     )
     parser.add_argument(
-        "--max-cycles", "-m",
-        type=int,
-        default=300,
-        help="Maximum number of workflow cycles to run (default: 300)"
+        "--config", "-c",
+        type=str,
+        default="config.yaml",
+        help="Path to configuration YAML file (default: config.yaml)"
     )
     parser.add_argument(
         "--resume", "-r",
@@ -702,12 +814,12 @@ def main():
     
     print(f"Starting workflow with:")
     print(f"  Session ID: {args.session_id}")
-    print(f"  Max cycles: {args.max_cycles}")
+    print(f"  Config file: {args.config}")
     print(f"  Resume mode: {args.resume}")
     
     launcher = Launcher(
         session_id=args.session_id,
-        max_cycles=args.max_cycles,
+        config_path=args.config,
         resume=args.resume
     )
     result = launcher.run()

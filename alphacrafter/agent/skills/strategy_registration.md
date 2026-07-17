@@ -37,7 +37,7 @@ Here is a reference strategy. You need to write scripts following this strategy'
 ```python
 # strategy.py
 @register_hook
-def momentum_strategy():
+def example_strategy():
     account = get_account_dict()
     watchlist = account.get("watch_list", [])
     current_positions = {p["symbol"]: p for p in account.get("positions", [])}
@@ -45,7 +45,7 @@ def momentum_strategy():
     gross_position_rate = account.get("gross_position_rate", 0)
     
     LOOKBACK_DAYS = 20
-    TOP_N = 20
+    TOP_N = 50
     TARGET_GROSS_RATE = 0.6  # Target gross exposure
     
     # If gross exposure exceeds target, only trim, no new entries

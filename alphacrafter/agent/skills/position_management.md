@@ -84,8 +84,8 @@ def position_sizing_example():
     
     # Hard limits
     MAX_GROSS_RATE = 0.8
-    LONG_CAP_RATE = 0.5   # Max long allocation as % of total assets
-    SHORT_CAP_RATE = 0.3  # Max short allocation as % of total assets
+    LONG_CAP_RATE = 0.6   # Max long allocation as % of total assets
+    SHORT_CAP_RATE = 0.2  # Max short allocation as % of total assets
     
     # Pre-allocate hard caps
     max_long_value = total_assets * LONG_CAP_RATE

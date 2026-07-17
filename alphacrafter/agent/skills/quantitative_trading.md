@@ -67,7 +67,7 @@ Retrieve historical stock daily data (The returned DataFrame is sorted from old 
 - `days`: `int` - number of past trading days to retrieve, minimum 1 (including current date)
 
 **Returns**
-- `pd.DataFrame` - columns: date (<class 'pandas.Timestamp'>), open, close, high, low, volume, change, pct_change, PE, PS, PB, DYR (Dividend Yield Rate)
+- `pd.DataFrame` - columns: date (<class 'pandas.Timestamp'>), open, close, high, low, volume, change, pct_change
 - `None` - if no data available before or on current_date
 
 **Example**
@@ -143,7 +143,7 @@ Get access to the account state.
   - Example: `universe = {symbol: df for symbol in watchlist}` where each df contains historical prices and fundamentals
   - Some stocks may have limited historical data due to recent IPOs or late listing dates. Remeber to check `len(df) >= min_required_days`
 
-2. Name Python scripts in `/scripts` as: `scripts/{role}_{YYYYMMDD}_{description}.py` where `YYYYMMDD` refers to the current backtest simulation date (not the actual system date)
+2. Name Python scripts in `/scripts` as: `scripts/<agent_id>_<YYYYMMDD>_<description>.py` where `YYYYMMDD` refers to the current backtest simulation date (not the actual system date)
 
 3. Shell Tool Output Handling
   - The shell tool returns terminal output directly to the agent

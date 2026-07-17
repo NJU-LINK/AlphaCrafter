@@ -20,7 +20,7 @@ ls factors/
 
 ### 2. Market Data Retrieval & Regime Assessment
 
-Obtain recent index and individual stock data to evaluate current market conditions for regime-aware factor selection.
+Obtain recent market information to evaluate current market conditions for regime-aware factor selection.
 
 ### 3. Factor Preprocessing & Alignment
 
@@ -35,7 +35,7 @@ Obtain recent index and individual stock data to evaluate current market conditi
 - Identify highly correlated clusters (correlation > 0.7)
 - Apply one of the following:
   - **Cluster pruning**: retain highest ICIR factor per cluster
-  - **Orthogonalization**: regress out correlated components (e.g., Gram-Schmidt)
+  - **Orthogonalization**: regress out correlated components
   - **Diversification constraint**: cap weight for any correlated group
 
 ### 5. Multi-Factor Ensemble Construction
@@ -51,23 +51,3 @@ Choose based on regime stability and data quality:
 - Primary (weight ~0.5–0.7): regime-favored factors
 - Secondary (weight ~0.2–0.4): supporting factors
 - Tertiary (weight ~0.0–0.1): hedge or diversifiers
-
-### Optimization for Factor Weighting
-When combining multiple factors, formal optimization methods can improve risk-adjusted returns compared to heuristic weighting. Below are common approaches:
-- Convex Optimization
-- Risk Parity
-- Maximum Diversification
-- Minimum Variance
-- Robust Optimization
-
-#### Machine Learning Ensemble (Optional)
-
-Alternative to closed-form optimization, data-driven methods can capture non-linear relationships and time-varying factor effectiveness:
-
-- **LightGBM Ranker**: Train on rolling windows with raw factor exposures as features and forward returns as target. Automatically learns interactions and regime-dependent weights. Output ensemble signal directly from model prediction.
-
-- **Regularized Linear Models (ElasticNet / Lasso)**: Coefficients serve as factor weights. More interpretable than tree-based methods; L1 penalty drives irrelevant factors to zero.
-
-- **Mean-Variance Optimization**: Classic quadratic programming approach. Requires rolling estimates of factor IC (mean) and factor correlation matrix (covariance). Effective when factor relationships are reasonably stationary.
-
-Consider regime stability and sample size when choosing among these methods.

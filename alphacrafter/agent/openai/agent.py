@@ -1,7 +1,7 @@
 import os
 import sys
 import json
-import signal
+import threading
 import contextlib
 from datetime import datetime
 from openai import OpenAI
@@ -12,29 +12,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from ..toolkit.base import BaseTool
 from ..skills.base import BaseSkill
-
-
-class InterruptHandler:
-    """Context manager for handling interrupts"""
-    
-    def __init__(self):
-        self.interrupted = False
-        self.original_handler = None
-    
-    def __enter__(self):
-        self.original_handler = signal.getsignal(signal.SIGINT)
-        signal.signal(signal.SIGINT, self._handler)
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        signal.signal(signal.SIGINT, self.original_handler)
-        if exc_type is KeyboardInterrupt:
-            return True
-        return False
-    
-    def _handler(self, sig, frame):
-        self.interrupted = True
-        print("\n\n⚠️  Interrupt received, stopping gracefully...")
 
 
 class Agent:
@@ -51,7 +28,6 @@ class Agent:
         config_path: str = "../config/models.json",
         log_file: str = "../logs/agent.json",
         summary_interval: int = 20,
-        force_tool_call: bool = False
     ):
         """
         Initialize the agent.
@@ -64,7 +40,6 @@ class Agent:
             config_path: Path to the models configuration JSON file
             log_file: Path to log file for metadata (JSON array format)
             summary_interval: Number of iterations between summaries (default: 20)
-            force_tool_call: Whether to force tool call on each iteration (default: False)
         """
         self.model_code = model_code
         self.toolkit = toolkit
@@ -73,7 +48,6 @@ class Agent:
         self.config_path = config_path
         self.log_file = log_file
         self.summary_interval = summary_interval
-        self.force_tool_call = force_tool_call
         
         # Load model configuration
         self.model_config = self._load_model_config()
@@ -83,8 +57,8 @@ class Agent:
         
         # Initialize OpenAI client
         self.client = OpenAI(
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("API_URL"),
+            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=os.getenv("OPENAI_API_URL"),
             timeout=1800
         )
         
@@ -99,7 +73,6 @@ class Agent:
         print(f"📦 Loaded tools: {list(self.function_map.keys())}")
         print(f"📚 Loaded skills: {[skill.get_name() for skill in self.skills]}")
         print(f"⚙️ Summary interval: {summary_interval} iterations")
-        print(f"⚙️ Force tool call: {force_tool_call}")
         
         # Load existing logs and append initialization entry
         self._append_log({
@@ -109,7 +82,6 @@ class Agent:
             "skills": [skill.get_name() for skill in self.skills],
             "instructions_length": len(self.instructions),
             "summary_interval": summary_interval,
-            "force_tool_call": force_tool_call,
             "timestamp": datetime.now().isoformat()
         })
     
@@ -290,9 +262,6 @@ class Agent:
         """
         print(f"📤 API Request - {len(input)} messages")
         
-        # Set tool_choice based on force_tool_call setting
-        tool_choice = "required" if self.force_tool_call else "auto"
-        
         # Call API
         response = self.client.responses.create(
             model=self.model_code,
@@ -300,7 +269,6 @@ class Agent:
             input=input,
             instructions=self.instructions,
             parallel_tool_calls=False,
-            tool_choice=tool_choice
         )
 
         # Extract token usage
@@ -368,7 +336,8 @@ class Agent:
         self, 
         initial_input: List[Dict[str, Any]], 
         max_iterations: int = 100,
-        finish_check: Optional[Callable[[], bool]] = None
+        finish_check: Optional[Callable[[], bool]] = None,
+        stop_event: Optional[threading.Event] = None
     ) -> Dict[str, Any]:
         """
         Run the agent with automatic multi-turn tool handling.
@@ -378,11 +347,13 @@ class Agent:
             max_iterations: Maximum number of iterations to prevent infinite loops
             finish_check: Optional function that takes no arguments and returns 
                         True if the run should finish, False to continue
+            stop_event: Optional threading.Event to signal early termination
             
         Returns:
             Dictionary containing the final result and summary information
         """
-        with InterruptHandler() as handler, self._run_context():
+        
+        with self._run_context():
             current_input = initial_input.copy()
             iteration = 0
             total_cost = 0
@@ -393,7 +364,11 @@ class Agent:
             print("🚀 AGENT RUN STARTED")
             print("=" * 60)
             
-            while iteration < max_iterations and not handler.interrupted:
+            while iteration < max_iterations:
+                if stop_event and stop_event.is_set():
+                    print("⏹️ Stop event triggered - terminating agent run")
+                    break
+                
                 iteration += 1
                 print(f"\n{'─' * 40}")
                 print(f"🔄 Iteration {iteration}/{max_iterations}")
@@ -401,7 +376,6 @@ class Agent:
                 
                 # Get response from model
                 result = self.get_response(current_input)
-                result["interrupted"] = handler.interrupted
                 last_result = result
                 
                 # Update metadata with iteration
@@ -416,12 +390,14 @@ class Agent:
                     print("✅ Finish condition met")
                     break
                 
-                # If no tool calls or interrupted, end the run
-                if not result["tool_calls"] or handler.interrupted:
-                    if handler.interrupted:
-                        print("⏹️ Run interrupted by user")
-                    else:
-                        print("✅ No more tool calls required - ending run")
+                # Check stop signal again after finish_check
+                if stop_event and stop_event.is_set():
+                    print("⏹️ Stop event triggered - terminating agent run")
+                    break
+                
+                # If no tool calls, end the run
+                if not result["tool_calls"]:
+                    print("✅ No more tool calls required - ending run")
                     break
                 
                 print(f"⚙️ Executing {len(result['tool_calls'])} tool call(s)...")
@@ -433,8 +409,8 @@ class Agent:
                 
                 # Execute tool calls and append results
                 for tool_call in result["tool_calls"]:
-                    if handler.interrupted:
-                        print("⏹️ Interrupted during tool execution")
+                    if stop_event and stop_event.is_set():
+                        print("⏹️ Stop event triggered during tool execution")
                         break
                     
                     func_name = tool_call["name"]
@@ -484,6 +460,9 @@ class Agent:
                         "output": json.dumps({func_name: output})
                     })
                 
+                if stop_event and stop_event.is_set():
+                    break
+                
                 # Generate summary based on interval
                 if iteration % self.summary_interval == 0:
                     print(f"📝 Reached {iteration} iterations, generating summary...")
@@ -512,7 +491,7 @@ class Agent:
                     
                     print(f"📋 Interval summary: {summary}")
             
-            if iteration >= max_iterations and not handler.interrupted:
+            if iteration >= max_iterations:
                 print(f"⚠️ Max iterations ({max_iterations}) reached")
             
             # Final summary
@@ -527,12 +506,16 @@ class Agent:
                 print(f"Tools used: {tools_used}")
             print("=" * 60)
             
+            # Determine if interrupted by stop event
+            interrupted = stop_event.is_set() if stop_event else False
+            
             # Prepare return value
             final_state = {
                 "success": last_result is not None,
                 "input": current_input,
                 "output_text": last_result.get("output_text") if last_result else None,
-                "interrupted": handler.interrupted
+                "interrupted": interrupted,
+                "stop_event_triggered": interrupted
             }
             
             # Log run completion
@@ -543,7 +526,8 @@ class Agent:
                 "total_cost": total_cost,
                 "total_tool_calls": len(all_tool_calls),
                 "tools_used": list(tools_used) if all_tool_calls else [],
-                "final_state": final_state
+                "final_state": final_state,
+                "interrupted": interrupted
             })
 
             print(f"🚀 Agent run completed. Output: {final_state.get('output_text')}")

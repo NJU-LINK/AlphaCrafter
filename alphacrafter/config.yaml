@@ -1,0 +1,37 @@
+# Miner Configuration
+miner:
+  count: 3
+  ids: ["miner_1", "miner_2", "miner_3"]
+  max_iterations: 25
+  model:
+    code: "gpt-5.3-codex"
+    config_path: "../config/models.json"
+
+# Screener Configuration
+screener:
+  max_iterations: 25
+  model:
+    code: "gpt-5.3-codex"
+    config_path: "../config/models.json"
+
+# Trader Configuration
+trader:
+  max_iterations: 25
+  model:
+    code: "gpt-5.3-codex"
+    config_path: "../config/models.json"
+
+# Workflow Configuration
+workflow:
+  max_cycles: 150
+
+# Logging
+logging:
+  workflow_log: "../logs/workflow.json"
+  miner_log_pattern: "../logs/miner_agent_{miner_id}.json"
+  screener_log: "../logs/screener_agent.json"
+  trader_log: "../logs/trader_agent.json"
+
+# Additional Info
+additional_info: |
+  CSI300 (000300.SH) is the CSI 300 Index, a capitalization-weighted stock market index designed to replicate the performance of the top 300 stocks traded on the Shanghai and Shenzhen stock exchanges. It is the primary benchmark for the Chinese A-share market, similar to the S&P 500 in the US. The index covers approximately 60% of the total market capitalization of the A-share market and is widely used for institutional investment benchmarking, index funds, and derivatives such as futures and options.

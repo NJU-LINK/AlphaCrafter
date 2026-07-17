@@ -14,7 +14,7 @@ class ShellTool(BaseTool):
     
     # Default whitelist of allowed commands
     DEFAULT_WHITELIST = [
-        'ls', 'python', 'python3','cat', 'touch'
+        'ls', 'python', 'echo', 'tail', 'grep'
     ]
     
     def __init__(
