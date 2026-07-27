@@ -1,211 +1,233 @@
 ---
-name: position_management
-description: Given current market regime and factor context, determine gross exposure, net exposure, cash allocation, and position limits for long-short portfolios.
+name: strategy_construction
+description: Generate, backtest, and select the optimal cross-sectional factor-based trading strategy given a factor ensemble and market regime.
 ---
 
-# Position Management Skill Document
+# Strategy Construction Skill
 
-## 1. Get Market Regime Assessment
+This skill explains how to generate strategy code, sample hyperparameters conditioned on market regime, run multiple backtest trials, and select the best-performing valid strategy for live execution.
 
-Get current market assessment:
+---
 
-- **Overall trend**: Bull market (uptrend), Bear market (downtrend), Sideways/Range-bound
-- **Trend strength**: Weak, Moderate, Strong (using MA slope, ADX, or consecutive direction days)
-- **Volatility regime**: Low, Normal, High
-- **Liquidity condition**: Normal, Tight, Stressed
-- **Correlation regime**: Low, Normal, High (stocks move together vs disperse)
-- **Sector rotation pace**: Slow, Normal, Fast
-- **Breadth**: Wide, Normal, Narrow
-- **Trend/Mean-Reversion tendency**: Trending, Mixed, Mean-Reverting
-- **Sentiment regime**: Neutral, Optimistic, Pessimistic, Extreme
+## Workflow
 
-## 2. Set Gross & Net Exposure Budgets
+### 1. Receive Inputs
 
-| Regime | Target Gross Exposure | Net Exposure Range |
-|:---|:---|:---|:---|:---|
-| Low Risk (trending, wide breadth, neutral sentiment) | 80% | ±20% |
-| Medium Risk (normal vol, normal liquidity, moderate correlation) | 50% | ±15% |
-| High Risk (high vol, tight liquidity, narrow breadth, extreme sentiment) | 20% | ±10% |
+Obtain the following from upstream agents:
 
-- Target Gross Exposure: normal operating level
-- Max Gross Exposure: hard ceiling (must not exceed 100%)
-- Net Exposure Range: upper bound for long bias, lower bound for short bias
+- **Factor Ensemble** from Screener Agent: list of (factor_id, weight, direction) tuples.
+- **Market Regime Assessment** from Screener Agent: trend direction, strength, volatility level, risk level.
 
-**IMPORTANT**: 
+If no factor ensemble is received, skip the entire cycle.
 
-- The position ratio should be moderate. Both excessively high (>80%) and excessively low (<15%) are undesirable. The strategy needs to be adjusted accordingly.
-- Bull market: Long position ratio should be greater than short position ratio
-- Bear market: Short position ratio should be greater than long position ratio
-- Do not rely on post-trade adjustments or forced liquidations to comply with these limits. Calculate the maximum allowable quantity before placing any order.
+### 2. Hyperparameter Sampling
 
-## 3. New Position Entry Rules
+The strategy uses the following tunable hyperparameters. Sample values conditioned on the diagnosed market regime.
 
-New buys/shorts allowed ONLY if ALL conditions met:
+| Parameter | Description | Sampling Guidance |
+|-----------|-------------|-------------------|
+| `N_long` | Number of stocks in long leg | Bull market: favor higher values. Bear/sideways: lower values. |
+| `N_short` | Number of stocks in short leg | Bull market: 0 or small. Bear market: higher values. Sideways: balanced with N_long. |
+| `beta` | Gross exposure scaling factor | Low risk: 0.6–0.8. Medium risk: 0.3–0.5. High risk: 0.1–0.2. |
+| `gamma` | Net exposure tilt | Positive for bull, negative for bear, near-zero for neutral. |
 
-- Current Gross <= Target Gross
-- Current Cash >= Min Cash (for longs) OR sufficient margin (for shorts)
-- Position size respects per-name caps
-- Regime != High Risk (or only small entries allowed)
+**Maximum number of backtest trials**: 3.
 
-If not allowed -> maintenance-only mode (trim only).
+Each trial uses a different hyperparameter sample. Generate distinct samples to explore meaningful variations.
 
-## 4. High Risk Regime Handling
+### 3. Portfolio Type Determination
 
-When High Risk regime:
+Portfolio type is jointly determined by the factor ensemble specification and market regime:
 
-- No new long or short entries (override all factor signals)
-- Daily trimming until Gross Exposure <= Max Gross Exposure
-- If already within limits, maintain but do not add
-- In bull markets, exercise caution when initiating short positions. In bear markets, exercise caution when initiating long positions. Maintain disciplined long/short position management
+| Regime | Resulting Portfolio Type |
+|--------|--------------------------|
+| Bull (strong uptrend) |Long-only (disable short leg) |
+| Bear (strong downtrend) | Long-short with short bias |
+| Sideways / Choppy | Balanced long-short or market-neutral or Long-only with reduced exposure |
 
-## 5. Strategy Validation
+### 4. Position Sizing and Risk Constraints
 
-Before live deployment, validate using backtest:
+The following constraints must be enforced in all generated strategy code:
 
-- Sharpe Ratio >= 1.0
-- Max Drawdown <= 10%
-- Calmar Ratio >= 1.0
+**Exposure Limits by Risk Level**:
 
-## 6. Note
+| Risk Level | Target Gross Exposure | Net Exposure Range | Per-Name Cap (long) | Per-Name Cap (short) |
+|------------|----------------------|--------------------|---------------------|----------------------|
+| Low Risk | 80% | ±20% | 10% of total assets | 5% of total assets |
+| Medium Risk | 50% | ±15% | 5% of total assets | 3% of total assets |
+| High Risk | 20% | ±10% | 2% of total assets | 2% of total assets |
 
-Always check gross position rate and net gross position of your account. Always close positions first, then open new positions based on the account's remaining available capital.
+**Important constraints**:
 
-**Reference**
+- Gross exposure must not exceed 100% under any circumstance.
+- Position ratio should be moderate. Both excessively high (>80%) and excessively low (<15%) gross exposure are undesirable.
+- Bull market: long position ratio must exceed short position ratio.
+- Bear market: short position ratio must exceed long position ratio.
+- Calculate maximum allowable quantity before placing any order. Do not rely on post-trade adjustments or forced liquidations to comply with limits.
+- Orders must be in multiples of 100 shares.
+
+**New Position Entry Rules**:
+
+New buys/shorts allowed only when ALL of the following hold:
+- Current gross exposure <= target gross exposure.
+- Sufficient available cash (for longs) or margin (for shorts).
+- Position size respects per-name caps.
+- Regime is not High Risk (or only small entries allowed if unavoidable).
+
+If conditions not met, operate in maintenance-only mode (trim only).
+
+### 5. Strategy Code Generation
+
+Generate executable Python strategy code (`strategy.py`) that implements:
+
+1. **Factor combination**: compute composite score as weighted sum of factor values, using weights and directions from the ensemble.
+2. **Stock ranking**: rank stocks by composite score, select top `N_long` for long and bottom `N_short` for short.
+3. **Position sizing**: apply exposure scaling factor, per-name caps, and cash constraints.
+4. **Order generation**: close existing positions not in new signals, then open new positions within capacity limits.
+5. **Risk compliance**: enforce all exposure limits and regime-specific rules described in Section 4.
+
+Keep strategy logic simple and interpretable. Avoid unnecessary complexity.
+
+### 6. Backtesting and Selection
+
+For each trial (up to 3):
+
+- Execute the generated strategy code using the backtesting tool.
+- Record performance metrics: total return (`r`), Sharpe ratio (`SR`), maximum drawdown (`MDD`).
+
+**Minimum acceptance criteria**:
+
+| Metric | Threshold |
+|--------|-----------|
+| Total Return | > 8% |
+| Sharpe Ratio | > 0.6 |
+| Max Drawdown | < 8% |
+
+A trial is valid only if ALL three criteria are satisfied.
+
+**Selection**: Among all valid trials, select the one with the highest Sharpe ratio as the best strategy.
+
+If no trial meets all criteria across 3 attempts, skip live execution and report that no viable strategy was found.
+
+**Important**: Do not overfit to backtest results. If a strategy performs poorly in backtesting, revise or discard it. However, do not endlessly tune to chase marginal improvements.
+
+### 7. Constraint Relaxation
+
+If no trades are generated during backtesting:
+
+- Systematically relax constraints one step at a time (e.g., reduce `N_long`/`N_short`, increase per-name caps, widen net exposure range).
+- Re-run backtest after each relaxation step.
+- Stop relaxing once trades are generated and criteria are met, or once further relaxation would violate hard risk limits.
+
+## Strategy Validation Criteria
+
+Before live deployment, the selected strategy must satisfy:
+
+| Metric | Threshold |
+|--------|-----------|
+| Sharpe Ratio | >= 1.0 |
+| Max Drawdown | <= 10% |
+| Calmar Ratio | >= 1.0 |
+
+## Code Example
+
+Below is a minimal strategy template. Replace <<< and >>> with triple backticks when writing actual code.
+
 ```python
 # strategy.py
-@register_hook
-def position_sizing_example():
-    account = get_account_dict()
-    watchlist = account.get("watch_list", [])
-    current_positions = {p["symbol"]: p for p in account.get("positions", [])}
-    available_cash = account.get("available_cash", 0)
-    total_assets = account.get("total_assets", 0)
-    gross_position_rate = account.get("gross_position_rate", 0)
-    
-    # Hard limits
-    MAX_GROSS_RATE = 0.8
-    LONG_CAP_RATE = 0.6   # Max long allocation as % of total assets
-    SHORT_CAP_RATE = 0.2  # Max short allocation as % of total assets
-    
-    # Pre-allocate hard caps
-    max_long_value = total_assets * LONG_CAP_RATE
-    max_short_value = total_assets * SHORT_CAP_RATE
-    
-    # Generate signals (commented - replace with actual logic)
-    # long_signals = [...]  # List of {"symbol": str, "score": float, "price": float}
-    # short_signals = [...]
-    
-    long_signals = []
-    short_signals = []
+from alphacrafter.sim.utils import get_account_dict, add_order, get_stock_daily_data
+import numpy as np
+import pandas as pd
 
-    # Close all existing positions first (full rebalance)
-    for symbol, pos in current_positions.items():
-        qty = pos.get("quantity", 0)
-        current_price = pos.get("current_price", 0)
-        
-        if qty > 0:  # Close long position
-            add_order(
-                symbol=symbol,
-                order_type="SELL",
-                price=current_price,
-                quantity=abs(qty)
-            )
-        elif qty < 0:  # Close short position
-            add_order(
-                symbol=symbol,
-                order_type="BUY",
-                price=current_price,
-                quantity=abs(qty)
-            )
-    
-    # Calculate current long/short values
-    current_long_value = sum(
-        p.get("market_value", 0) for p in current_positions.values() if p.get("quantity", 0) > 0
-    )
-    current_short_value = abs(sum(
-        p.get("market_value", 0) for p in current_positions.values() if p.get("quantity", 0) < 0
-    ))
-    
-    # Calculate remaining capacity
-    remaining_long_capacity = max_long_value - current_long_value
-    remaining_short_capacity = max_short_value - current_short_value
-    
-    # Close positions not in signals
-    long_symbols_to_keep = {s["symbol"] for s in long_signals}
-    short_symbols_to_keep = {s["symbol"] for s in short_signals}
-    
-    for symbol, pos in current_positions.items():
-        qty = pos.get("quantity", 0)
-        current_price = pos.get("current_price", 0)
-        
-        if qty > 0 and symbol not in long_symbols_to_keep:
-            # SELL to close long
-            add_order(
-                symbol=symbol,
-                order_type="SELL",
-                price=current_price,
-                quantity=abs(qty)
-            )
-        elif qty < 0 and symbol not in short_symbols_to_keep:
-            # BUY to cover short
-            add_order(
-                symbol=symbol,
-                order_type="BUY",
-                price=current_price,
-                quantity=abs(qty)
-            )
-    
-    # Open new long positions
-    if long_signals and remaining_long_capacity > 0:
-        long_allocation = remaining_long_capacity / len(long_signals)
-        
-        for signal in long_signals:
-            symbol = signal["symbol"]
-            price = signal["price"]
-            
-            # Skip if already holding long
-            if symbol in current_positions and current_positions[symbol].get("quantity", 0) > 0:
-                continue
-            
-            target_value = min(long_allocation, remaining_long_capacity)
-            shares_to_buy = int(target_value / price / 100) * 100
-            
-            if shares_to_buy > 0:
-                cost = shares_to_buy * price
-                
-                if cost <= available_cash and cost <= remaining_long_capacity:
-                    # BUY signal
-                    add_order(
-                        symbol=symbol,
-                        order_type="BUY",
-                        price=price,
-                        quantity=shares_to_buy
-                    )
-                    available_cash -= cost
-                    remaining_long_capacity -= cost
-    
-    # Open new short positions
-    if short_signals and remaining_short_capacity > 0:
-        short_allocation = remaining_short_capacity / len(short_signals)
-        
-        for signal in short_signals:
-            symbol = signal["symbol"]
-            price = signal["price"]
-            
-            # Skip if already holding short
-            if symbol in current_positions and current_positions[symbol].get("quantity", 0) < 0:
-                continue
-            
-            target_value = min(short_allocation, remaining_short_capacity)
-            shares_to_short = int(target_value / price / 100) * 100
-            
-            if shares_to_short > 0:
-                # SELL short signal
-                add_order(
-                    symbol=symbol,
-                    order_type="SELL",
-                    price=price,
-                    quantity=shares_to_short
-                )
-                remaining_short_capacity -= shares_to_short * price
+# Hyperparameters (set by Trader based on regime)
+N_LONG = 10            # number of stocks in long leg
+N_SHORT = 0            # number of stocks in short leg (0 for long-only)
+BETA = 0.6             # gross exposure scaling factor
+WEIGHTING = "equal"    # "equal", "score_weighted", or "cap_weighted"
+
+# Hard risk limits (from regime assessment)
+TARGET_GROSS = 0.5
+MAX_GROSS = 0.8
+NET_EXPOSURE_MIN = -0.15
+NET_EXPOSURE_MAX = 0.15
+LONG_CAP_PER_NAME = 0.05
+SHORT_CAP_PER_NAME = 0.03
+MIN_CASH_RESERVE = 0.05
+
+# Factor ensemble
+FACTOR_ENSEMBLE = []   # List of {"factor_id": str, "weight": float, "direction": str}
+
+account = get_account_dict()
+watchlist = account.get("watch_list", [])
+current_positions = {p["symbol"]: p for p in account.get("positions", [])}
+available_cash = account.get("available_cash", 0)
+total_assets = account.get("total_assets", 0)
+
+max_long_value = total_assets * LONG_CAP_PER_NAME
+max_short_value = total_assets * SHORT_CAP_PER_NAME
+target_gross_value = total_assets * TARGET_GROSS
+
+# Compute composite factor scores
+# Placeholder: replace with actual factor computation from ensemble
+scores = {}
+for sym in watchlist:
+    scores[sym] = 0.0  # weighted sum of factor values
+
+# Rank and select
+ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+long_candidates = [s for s in ranked if s[1] > 0][:N_LONG]
+short_candidates = [s for s in ranked if s[1] < 0][-N_SHORT:] if N_SHORT > 0 else []
+
+long_symbols = {s[0] for s in long_candidates}
+short_symbols = {s[0] for s in short_candidates}
+
+# Close positions not in new signals
+for sym, pos in current_positions.items():
+    qty = pos.get("quantity", 0)
+    price = pos.get("current_price", 0)
+    if qty > 0 and sym not in long_symbols:
+        add_order(symbol=sym, order_type="SELL", price=price, quantity=abs(qty))
+    elif qty < 0 and sym not in short_symbols:
+        add_order(symbol=sym, order_type="BUY", price=price, quantity=abs(qty))
+
+# Open new long positions
+if long_candidates:
+    if WEIGHTING == "equal":
+        alloc_per_stock = (target_gross_value * BETA) / len(long_candidates)
+    else:
+        total_score = sum(s[1] for s in long_candidates)
+        alloc_per_stock = None  # compute per-stock below
+
+    for sym, score in long_candidates:
+        if sym in current_positions and current_positions[sym].get("quantity", 0) > 0:
+            continue
+        price = get_stock_daily_data(sym, days=1)["close"].iloc[-1]
+        if WEIGHTING == "score_weighted" and total_score > 0:
+            target_value = (score / total_score) * target_gross_value * BETA
+        else:
+            target_value = alloc_per_stock
+        target_value = min(target_value, max_long_value)
+        shares = int(target_value / price / 100) * 100
+        if shares > 0 and shares * price <= available_cash:
+            add_order(symbol=sym, order_type="BUY", price=price, quantity=shares)
+            available_cash -= shares * price
+
+# --- Step 5: Open new short positions (if applicable) ---
+if short_candidates:
+    alloc_per_stock = (target_gross_value * BETA) / len(short_candidates)
+    for sym, score in short_candidates:
+        if sym in current_positions and current_positions[sym].get("quantity", 0) < 0:
+            continue
+        price = get_stock_daily_data(sym, days=1)["close"].iloc[-1]
+        target_value = min(alloc_per_stock, max_short_value)
+        shares = int(target_value / price / 100) * 100
+        if shares > 0:
+            add_order(symbol=sym, order_type="SELL", price=price, quantity=shares)
 ```
+
+## Notes
+
+1. Always close positions first, then open new positions based on remaining available capital.
+2. Calculate maximum allowable quantity before placing any order. Do not rely on post-trade adjustments.
+3. The position ratio should be moderate. Avoid both excessively high (>80%) and excessively low (<15%) gross exposure.
+4. Do not overfit to backtest results. A strategy performing poorly in backtesting should be revised or discarded.

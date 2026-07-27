@@ -47,10 +47,10 @@ class Exchange:
         self.commission_rate = 0.0001
         
         # Margin requirements for short selling (percentage of position value)
-        self.short_margin_requirement = 0.2  # 20% margin required for shorts
+        self.short_margin_requirement = 0.5
         
         # Maintenance margin requirement (minimum equity percentage)
-        self.maintenance_margin = 0.8  # 80% maintenance margin
+        self.maintenance_margin = 0.3
         
         # Interest rate for short proceeds (not implemented in this simple version)
         self.short_interest_rate = 0.0

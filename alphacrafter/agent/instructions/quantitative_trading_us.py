@@ -22,8 +22,8 @@ Initially, the account starts with a cash balance of 10,000,000 USD and no stock
    - Commission rate: 0.01% (executed_amount * 0.0001)
 
 4. Margin:
-   - Short margin requirement: 20% of position value (initial margin required to open a short position)
-   - Maintenance margin: 80% of equity (minimum equity percentage required to maintain positions)
+   - Short margin requirement: 50% of position value (initial margin required to open a short position)
+   - Maintenance margin: 30% of equity (minimum equity percentage required to maintain positions)
    - Margin calls are triggered when equity falls below maintenance margin
 
 5. Timing:

@@ -479,7 +479,7 @@ class BacktestTool(BaseTool):
                         "days": {
                             "type": "integer",
                             "description": "Number of trading days to go back for backtest (must be positive integer)",
-                            "maximum": 120
+                            "maximum": 252
                         }
                     },
                     "required": ["days"]
