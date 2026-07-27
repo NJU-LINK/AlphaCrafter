@@ -30,7 +30,7 @@ from agent.skills import (
     FactorMiningSkill,
     FactorScreeningSkill,
     StrategyRegistrationSkill,
-    PositionManagementSkill
+    StrategyConstructionSkill
 )
 
 from alphacrafter.sim.utils import finish_check, get_date_str
@@ -311,15 +311,15 @@ class Launcher:
     def _create_screener_agent(self) -> Agent:
         """Create and configure screener agent for factor selection and ensemble construction."""
         toolkit = [
+            ReadFileTool(),
+            WriteFileTool(),
             ShellTool(),
-            GetStockDataTool(),
             GetIndexDataTool(),
-            SearchFactorTool(),
             GetFinancialStatementsTool(),
             GetNewsTool()
         ]
         
-        skills = [FactorScreeningSkill()]
+        skills = [QuantitativeTradingSkill(), FactorScreeningSkill()]
         
         agent = Agent(
             model_code=self.screener_model_config['code'],
@@ -342,7 +342,7 @@ class Launcher:
             StepTool(),
         ]
         
-        skills = [QuantitativeTradingSkill(), StrategyRegistrationSkill(), PositionManagementSkill()]
+        skills = [QuantitativeTradingSkill(), StrategyRegistrationSkill(), StrategyConstructionSkill()]
         
         agent = Agent(
             model_code=self.trader_model_config['code'],

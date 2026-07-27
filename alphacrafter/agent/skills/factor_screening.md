@@ -26,6 +26,8 @@ List all `.json` files (excluding `_deprecated`). Each factor record contains de
 
 ### 3. Factor Suitability Scoring
 
+Write Python scripts into: `scripts/screener_<YYYYMMDD>_<description>.py`
+
 For each factor in the active library:
 
 1. Compute the factor vector across the current watchlist universe for each of the most recent trading days in the lookback window.
