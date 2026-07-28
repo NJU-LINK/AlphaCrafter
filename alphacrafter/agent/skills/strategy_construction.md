@@ -101,7 +101,7 @@ For each trial (up to 3):
 |--------|-----------|
 | Total Return | > 8% |
 | Sharpe Ratio | > 0.6 |
-| Max Drawdown | < 8% |
+| Max Drawdown | > -8% |
 
 A trial is valid only if ALL three criteria are satisfied.
 

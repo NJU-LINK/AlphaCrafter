@@ -14,7 +14,7 @@
   </a>
 </p>
 
-**AlphaCrafter** is a multi‑agent framework for cross‑sectional factor investing. It integrates LLM‑driven factor discovery, regime‑aware factor selection, and adaptive execution into a single autonomous pipeline. The system operates through three specialized agents — **Miner**, **Screener**, and **Trader** — in a daily rotation, forming a closed hypothesis–validation–execution loop.
+**AlphaCrafter** is a harness-based multi‑agent framework for cross‑sectional quantitative trading. It integrates LLM‑driven factor discovery, regime‑aware factor selection, and adaptive execution into a single autonomous pipeline.
 
 ---
 
