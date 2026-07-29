@@ -71,8 +71,8 @@ python main.py --session_id gpt-5.3-backtest-csi300 --resume (optional)
 If you find AlphaCrafter useful for your research, please cite our paper:
 
 ```bibtex
-@misc{yuan2026alphacrafterfullstackmultiagentframework,
-      title={AlphaCrafter: A Full-Stack Multi-Agent Framework for Cross-Sectional Quantitative Trading}, 
+@misc{yuan2026alphacrafterharnessingmultiagentworkflows,
+      title={AlphaCrafter: Harnessing Multi-Agent Workflows for Cross-Sectional Quantitative Trading}, 
       author={Yishuo Yuan and Jiayi Sheng and Sirui Zeng and Jiaqi Wang and Jiaheng Liu},
       year={2026},
       eprint={2605.05580},
